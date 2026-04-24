@@ -1,0 +1,10 @@
+llm:
+  baseUrl: https://api.openai.com/v1
+  apiKey: your-api-key-here
+  model: gpt-4o
+
+# Environment variable override (optional):
+# You can also set these via environment variables with CHERYL_ prefix:
+# CHERYL_LLM_BASEURL=https://api.openai.com/v1
+# CHERYL_LLM_APIKEY=your-api-key-here
+# CHERYL_LLM_MODEL=gpt-4o
