@@ -5,6 +5,7 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/ssestream"
 )
 
 type Client struct {
@@ -30,6 +31,17 @@ func (c *Client) Chat(ctx context.Context, messages []openai.ChatCompletionMessa
         Messages: messages,
         Tools:    c.tools,
     })
+}
+
+func (c *Client) ChatStream(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (*ssestream.Stream[openai.ChatCompletionChunk]) {
+	stream := c.openaiClient.Chat.Completions.NewStreaming(
+		ctx, openai.ChatCompletionNewParams{
+			Model: c.model,
+			Messages: messages,
+			Tools: c.tools,
+		},
+	)
+	return stream
 }
 
 func (c *Client) HasToolCalls(resp *openai.ChatCompletion) bool {
