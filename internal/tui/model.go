@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/cheryl-chun/cheryl-code/internal/llm"
 )
 
 type Model struct {
 	viewport viewport.Model // 对话历史显示区
 	textarea textarea.Model // 用户输入框
+	spinner  spinner.Model  // 等待动画
 
 	messages []Message // 对话历史
 	width    int       // 终端宽度
@@ -45,9 +48,14 @@ func NewModel(agent *llm.Agent) Model {
 	vp := viewport.New(80, 20)
 	vp.SetContent(welcomeMessage())
 
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
 	return Model{
 		textarea: ta,
 		viewport: vp,
+		spinner:  sp,
 		messages: []Message{},
 		ready:    false,
 		agent:    agent,
@@ -56,7 +64,10 @@ func NewModel(agent *llm.Agent) Model {
 
 // Init 初始化命令
 func (m Model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(
+		textarea.Blink,
+		m.spinner.Tick,
+	)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -67,12 +78,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastKey = fmt.Sprintf("Key: %s | Type: %d | Alt: %v",
 			msg.String(), msg.Type, msg.Alt)
 
-        if msg.Type == tea.KeyEnter {
-            // Alt+Enter 发送
-            return m.sendMessage()
-        }
+		if msg.Type == tea.KeyEnter {
+			// Alt+Enter 发送
+			return m.sendMessage()
+		}
 		switch msg.String() {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m, tea.Quit
 		case "shift+enter":
 			return m.sendMessage()
@@ -89,13 +100,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+
+		headerHeight := 2       // 顶部标题/边距
+		footerHeight := 2       // 底部帮助信息
+		textareaHeight := 4     // 输入框高度
+		
+		// viewport 占据剩余空间
+		vpHeight := msg.Height - headerHeight - textareaHeight - footerHeight
+		
+		m.viewport.Width = msg.Width
+		m.viewport.Height = vpHeight
+		
+		m.textarea.SetWidth(msg.Width)
+		m.textarea.SetHeight(textareaHeight)
+		
 		if !m.ready {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - 6
-			m.textarea.SetWidth(msg.Width)
-			m.textarea.SetHeight(4)
+			m.viewport.SetContent(welcomeMessage())
 			m.ready = true
+		} else {
+			// 窗口大小变化时，重新渲染内容
+			m.updateViewportContent()
 		}
+	}
+
+	if m.waiting {
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 	m.textarea, cmd = m.textarea.Update(msg)
 	cmds = append(cmds, cmd)
@@ -106,16 +136,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	if !m.ready {
-		return "Initializing..."
-	}
-
-	return fmt.Sprintf(
-		"%s\n\n%s\n\n%s",
-		m.viewport.View(),                 // 对话历史
-		m.textarea.View(),                 // 输入框
-		"Ctrl+Enter: Send • Ctrl+C: Quit", // 帮助
-	)
+    if !m.ready {
+        return "Initializing..."
+    }
+    
+    // 定义样式
+    var (
+        subtle = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
+        
+        statusBarStyle = lipgloss.NewStyle().
+            Foreground(lipgloss.AdaptiveColor{Light: "#343433", Dark: "#C1C6B2"}).
+            Background(subtle).
+            Padding(0, 1).
+            Width(m.width)  // ← 撑满宽度
+        
+        inputBoxStyle = lipgloss.NewStyle().
+            Border(lipgloss.RoundedBorder()).
+            BorderForeground(lipgloss.Color("62")).
+            Width(m.width - 4)  // 减去边框宽度
+    )
+    
+    // 状态栏内容
+    statusText := "Enter: Send • Ctrl+C: Quit"
+    if m.waiting {
+        statusText = fmt.Sprintf("%s Processing...", m.spinner.View())
+    }
+    
+    // 组装界面
+    return lipgloss.JoinVertical(
+        lipgloss.Left,
+        m.viewport.View(),
+        "",  // 空行
+        inputBoxStyle.Render(m.textarea.View()),
+        statusBarStyle.Render(statusText),
+    )
 }
 
 func (m Model) sendMessage() (Model, tea.Cmd) {
@@ -124,17 +178,17 @@ func (m Model) sendMessage() (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	m.waiting = true
 	m.addMessage("user", userInput)
-
 	m.textarea.Reset()
 
-	m.waiting = true
 
 	return m, m.callAgent(userInput)
 }
 
 func (m *Model) callAgent(prompt string) tea.Cmd {
 	return func() tea.Msg {
+
 		ctx := context.Background()
 		response, err := m.agent.Run(ctx, prompt)
 

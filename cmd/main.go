@@ -17,7 +17,7 @@ func main() {
 		configPath string
 	)
 
-	flag.StringVar(&configPath, "config", "configs/config.yaml", "Path to config file")
+	flag.StringVar(&configPath, "config", "configs/config_intsig.yaml", "Path to config file")
 	flag.Parse()
 
 	// Load config
