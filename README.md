@@ -35,9 +35,34 @@ LLM 思考
   └─ 否 → 返回最终答案
 ```
 
+
+阻塞模式：
+
+```go
+result, err := agent.Run(ctx, "读取 config.yaml")
+fmt.Println(result)  // 等待完成后一次性显示
+```
+
+流式模式，实时显示 LLM 输出：
+
+```go
+eventCh, err := agent.RunStream(ctx, "读取 config.yaml")
+
+for event := range eventCh {
+    switch event.Type {
+    case llm.StreamContent:
+        fmt.Print(event.Content)  // 打字机效果
+    case llm.StreamToolCall:
+        fmt.Printf("\n🔧 %s\n", event.ToolName)
+    case llm.StreamDone:
+        fmt.Println("\n完成")
+    }
+}
+```
+
 ### 代码实现（`internal/llm/agent.go`）
 
-核心数据结构：
+**核心数据结构：**
 ```go
 type Agent struct {
     client   *Client              // LLM 客户端
@@ -46,7 +71,7 @@ type Agent struct {
 }
 ```
 
-循环逻辑：
+**一次性模式：**
 ```go
 func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
     a.manager.AddUser(prompt)  // 1. 添加用户消息
@@ -65,6 +90,66 @@ func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
         }
         // 5. 继续循环，让 LLM 看到工具结果
     }
+}
+```
+
+### 流式输出关键点
+
+#### SSE
+
+OpenAI SDK 使用 `ssestream.Stream` 处理流式响应：
+
+```go
+stream := client.Chat.Completions.NewStreaming(ctx, params)
+
+for stream.Next() {
+    chunk := stream.Current()  // 获取当前 chunk
+    delta := chunk.Choices[0].Delta
+    
+    if delta.Content != "" {
+        fmt.Print(delta.Content)  // 逐字输出
+    }
+}
+
+if err := stream.Err(); err != nil {
+    // 处理错误
+}
+```
+
+#### ToolCallBuilder
+
+流式 API 中，工具调用可能分多个 chunk 返回：
+
+```
+chunk1: {Index: 0, ID: "call_xxx"}
+chunk2: {Index: 0, Function.Name: "read_file"}
+chunk3: {Index: 0, Function.Arguments: "{\"path"}
+chunk4: {Index: 0, Function.Arguments: "\":\"file.txt\"}"}
+```
+
+使用 Builder 模式拼接完整的工具调用：
+
+```go
+type ToolCallBuilder struct {
+    ID        string
+    Name      string
+    Arguments string  // 逐步拼接
+}
+
+func (b *ToolCallBuilder) Append(tc openai.ChatCompletionChunkChoiceDeltaToolCall) {
+    if tc.ID != "" {
+        b.ID = tc.ID
+    }
+    if tc.Function.Name != "" {
+        b.Name += tc.Function.Name
+    }
+    if tc.Function.Arguments != "" {
+        b.Arguments += tc.Function.Arguments  // 拼接 JSON 片段
+    }
+}
+
+func (b *ToolCallBuilder) IsComplete() bool {
+    return b.ID != "" && b.Name != "" && b.Arguments != ""
 }
 ```
 
