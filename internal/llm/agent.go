@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/cheryl-chun/cheryl-code/internal/messages"
 	"github.com/cheryl-chun/cheryl-code/internal/tools"
@@ -14,6 +15,12 @@ type Agent struct {
 	client   *Client
 	manager  *messages.MessageManager
 	registry *tools.ToolRegistry
+
+	// state manage
+	state *AgentState
+
+	// resume chanel
+	resumeCh chan struct{}
 }
 
 func NewAgent(client *Client, registry *tools.ToolRegistry) *Agent {
@@ -21,6 +28,32 @@ func NewAgent(client *Client, registry *tools.ToolRegistry) *Agent {
 		client:   client,
 		registry: registry,
 		manager:  nil,
+		state:    NewAgentState(100),
+		resumeCh: make(chan struct{}, 1),
+	}
+}
+
+func (a *Agent) GetState() *AgentState {
+	return a.state
+}
+
+func (a *Agent) ApproveToolCall(id string) error {
+	return a.state.ApproveToolCall(id)
+}
+
+func (a *Agent) RejectToolCall(id string) error {
+	return a.state.RejectToolCall(id)
+}
+
+func (a *Agent) ApproveAll() error {
+	return a.state.ApproveAll()
+}
+
+func (a *Agent) ResumeExecution() {
+	select {
+	case a.resumeCh <- struct{}{}:
+	default:
+		// TODO: ignore
 	}
 }
 
@@ -46,8 +79,6 @@ func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
 			a.manager.AddTool(result, toolCall.ID)
 		}
 	}
-
-	return "", fmt.Errorf("unexpected error")
 }
 
 func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEvent, error) {
@@ -64,6 +95,8 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 			}
 		}()
 
+		a.state.Reset()
+
 		a.manager = messages.NewMessageManager()
 		a.manager.AddUser(prompt)
 
@@ -72,7 +105,7 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 			var fullContent string
 			toolCallsBuilder := make(map[int64]*ToolCallBuilder)
 
-			// 读取流式响应
+			// read stream output
 			for stream.Next() {
 				chunk := stream.Current()
 
@@ -82,6 +115,7 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 
 				delta := chunk.Choices[0].Delta
 
+				// content
 				if delta.Content != "" {
 					fullContent += delta.Content
 					eventCh <- StreamEvent{
@@ -119,9 +153,13 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 				return
 			}
 
+			// tool calling
+			a.state.Status = AgentExecutingTools
+
 			// run tool calls
-			var toolCalls []openai.ChatCompletionMessageToolCallUnionParam
-			var toolResults []ToolResults
+			allToolStates := []*ToolCallState{}
+			hasApprovalRequired := false
+
 			for _, builder := range toolCallsBuilder {
 				if !builder.IsComplete() {
 					continue
@@ -129,25 +167,114 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 
 				// parse args
 				var args map[string]interface{}
-				json.Unmarshal([]byte(builder.Arguments), &args)
+				if err := json.Unmarshal([]byte(builder.Arguments), &args); err != nil {
+					eventCh <- StreamEvent{
+						Type:  StreamError,
+						Error: fmt.Errorf("failed to parse tool args: %v", err),
+					}
+					continue
+				}
 
-				// execute tool
-				result := a.executeToolByName(builder.Name, builder.Arguments, builder.ID)
+				// tool state
+				tc := NewToolCallState(builder.ID, builder.Name, args)
+
+				tool, ok := a.registry.Get(builder.Name)
+				if !ok {
+					eventCh <- StreamEvent{
+						Type:  StreamError,
+						Error: fmt.Errorf("unknown tool: %s", builder.Name),
+					}
+					continue
+				}
+
+				tc.NeedApproval = tool.RequiresApproval(args)
+
+				// need user approve
+				if tc.NeedApproval {
+					tc.Transition(ToolStatusPendingApproval)
+					a.state.AddToolCall(tc)
+					hasApprovalRequired = true
+
+					eventCh <- StreamEvent{
+						Type:     StreamApprovalRequired,
+						ToolCall: tc,
+					}
+				} else {
+					tc.Transition(ToolStatusRunning)
+					a.state.AddToolCall(tc)
+				}
+
+				allToolStates = append(allToolStates, tc)
+
+			}
+			if hasApprovalRequired {
+				select {
+				case <-a.resumeCh:
+				case <-ctx.Done():
+					eventCh <- StreamEvent{
+						Type:  StreamError,
+						Error: ctx.Err(),
+					}
+					return
+				}
+			}
+
+			// execute tool
+			var toolCalls []openai.ChatCompletionMessageToolCallUnionParam
+			var toolResults []ToolResults
+
+			for _, tc := range allToolStates {
+				if tc.Status() != ToolStatusRunning && tc.Status() != ToolStatusApproved {
+					continue
+				}
+
+				if tc.Status() == ToolStatusRunning {
+					tc.Transition(ToolStatusRunning)
+					a.state.UpdateToolCallStatus(tc.ID, ToolStatusRunning)
+				}
 
 				eventCh <- StreamEvent{
 					Type:     StreamToolCall,
-					ToolName: builder.Name,
-					ToolArgs: args,
+					ToolCall: tc,
 				}
 
-				// save tool call result
-				toolCalls = append(toolCalls, builder.Build())
+				result := a.executeToolByName(tc.Name, tc.ArgsRaw, tc.ID)
+
+				tc.Result = result
+
+				if strings.HasPrefix(result, "Error:") || strings.HasPrefix(result, "Failed") {
+					tc.Error = fmt.Errorf("%s", result)
+					tc.Transition(ToolStatusError)
+					a.state.UpdateToolCallStatus(tc.ID, ToolStatusError)
+				} else {
+					tc.Transition(ToolStatusSuccess)
+					a.state.UpdateToolCallStatus(tc.ID, ToolStatusSuccess)
+				}
+
+				// 发送工具结果事件
+				eventCh <- StreamEvent{
+					Type:       StreamToolResult,
+					ToolCall:   tc,
+					ToolResult: result,
+				}
+
+				toolCalls = append(toolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+					OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+						ID: tc.ID,
+						Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+							Name:      tc.Name,
+							Arguments: tc.ArgsRaw,
+						},
+						Type: "function",
+					},
+				})
+
 				toolResults = append(toolResults, ToolResults{
-					id:     builder.ID,
+					id:     tc.ID,
 					result: result,
 				})
 			}
-			// add agent message
+
 			a.manager.AddAssistant(fullContent, toolCalls)
 
 			// add tool message
