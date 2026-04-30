@@ -49,6 +49,10 @@ func (a *Agent) ApproveAll() error {
 	return a.state.ApproveAll()
 }
 
+func (a *Agent) RejectAll() error {
+	return a.state.RejectAll()
+}
+
 func (a *Agent) ResumeExecution() {
 	select {
 	case a.resumeCh <- struct{}{}:

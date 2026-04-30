@@ -18,8 +18,8 @@ const (
 type AgentState struct {
 	Status           AgentStatus
 	ActiveToolCalls  map[string]*ToolCallState
-	PendingApprovals map[string]*ToolCallState // need user approve
-	CompletedTools   []*ToolCallState          // already finished
+	PendingApprovals []*ToolCallState // need user approve
+	CompletedTools   []*ToolCallState // already finished
 	TurnCount        int
 	MaxTurns         int
 	LastError        error
@@ -29,7 +29,7 @@ func NewAgentState(maxTurns int) *AgentState {
 	return &AgentState{
 		Status:           AgentIdle,
 		ActiveToolCalls:  make(map[string]*ToolCallState),
-		PendingApprovals: make(map[string]*ToolCallState),
+		PendingApprovals: make([]*ToolCallState, 0),
 		CompletedTools:   make([]*ToolCallState, 0),
 		MaxTurns:         maxTurns,
 	}
@@ -41,7 +41,7 @@ func (a *AgentState) AddToolCall(tc *ToolCallState) {
 	// if tool need to approve
 	// add tool to pending queue
 	if tc.NeedApproval && tc.Status() == ToolStatusApproved {
-		a.PendingApprovals[tc.ID] = tc
+		a.PendingApprovals = append(a.PendingApprovals, tc)
 		a.Status = AgentWaitingApproval
 	}
 }
@@ -77,7 +77,7 @@ func (a *AgentState) ApproveToolCall(id string) error {
 		return err
 	}
 
-	delete(a.PendingApprovals, id)
+	a.deletePendingTool(tc.ID)
 
 	// all tool have approved
 	if len(a.PendingApprovals) == 0 {
@@ -97,7 +97,7 @@ func (a *AgentState) RejectToolCall(id string) error {
 		return err
 	}
 
-	delete(a.PendingApprovals, id)
+	a.deletePendingTool(tc.ID)
 
 	if tc.IsCompleted() {
 		a.CompletedTools = append(a.CompletedTools, tc)
@@ -118,7 +118,7 @@ func (a *AgentState) ApproveAll() error {
 		}
 	}
 
-	a.PendingApprovals = map[string]*ToolCallState{}
+	a.PendingApprovals = []*ToolCallState{}
 
 	a.Status = AgentExecutingTools
 
@@ -137,7 +137,7 @@ func (s *AgentState) RejectAll() error {
 		}
 	}
 
-	s.PendingApprovals = map[string]*ToolCallState{}
+	s.PendingApprovals = []*ToolCallState{}
 	s.Status = AgentExecutingTools
 
 	return nil
@@ -150,10 +150,19 @@ func (a *AgentState) HasPendingApprovals() bool {
 func (a *AgentState) Reset() {
 	a.Status = AgentIdle
 	a.ActiveToolCalls = make(map[string]*ToolCallState)
-	a.PendingApprovals = make(map[string]*ToolCallState)
+	a.PendingApprovals = []*ToolCallState{}
 	a.CompletedTools = []*ToolCallState{}
 	a.TurnCount = 0
 	a.LastError = nil
+}
+
+func (a *AgentState) deletePendingTool(id string) {
+	for i, tc := range a.PendingApprovals {
+		if tc.ID == id {
+			a.PendingApprovals = append(a.PendingApprovals[:i], a.PendingApprovals[i+1:]...)
+			return
+		}
+	}
 }
 
 func errToolCallNotFound(id string) error {
