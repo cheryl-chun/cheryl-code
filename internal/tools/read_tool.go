@@ -12,6 +12,10 @@ type ReadTool struct {
 	rootPath string
 }
 
+func (t *ReadTool) RequiresApproval(args map[string]any) bool {
+	return false
+}
+
 func (t *ReadTool) Name() string {
 	return "Read"
 }

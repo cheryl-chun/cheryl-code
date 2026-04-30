@@ -21,6 +21,7 @@ type Tool interface {
 	Description() string
 	Parameters() any
 	Execute(args map[string]any) (string, error)
+	RequiresApproval(args map[string]any) bool
 }
 
 type ToolRegistry struct {
@@ -69,7 +70,6 @@ func (r *ToolRegistry) ToOpenAITools() []openai.ChatCompletionToolUnionParam {
 	tools := r.GetAll()
 	result := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
 	for _, tool := range tools {
-		// 类型转换：any -> map[string]any -> FunctionParameters
 		params := tool.Parameters().(map[string]any)
 
 		result = append(result, openai.ChatCompletionFunctionTool(

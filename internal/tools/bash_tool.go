@@ -2,6 +2,7 @@ package tools
 
 import (
 	"os/exec"
+	"strings"
 )
 
 var _ Tool = (*BashTool)(nil)
@@ -44,6 +45,33 @@ func (b *BashTool) Parameters() any {
 		},
 		"required": []string{"command"},
 	}
+}
+
+func (t *BashTool) RequiresApproval(args map[string]any) bool {
+	command, ok := args["command"].(string)
+	if !ok {
+		return true 
+	}
+
+	// only read
+	safeCommands := []string{"ls", "pwd", "echo", "cat", "head", "tail", "grep"}
+
+	for _, safe := range safeCommands {
+		if strings.HasPrefix(strings.TrimSpace(command), safe+" ") ||
+			strings.TrimSpace(command) == safe {
+			return false // 安全命令，不需要审批
+		}
+	}
+
+	// dangerous command
+	dangerousPatterns := []string{"rm ", "mv ", "chmod ", "sudo ", "> ", ">>"}
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(command, pattern) {
+			return true
+		}
+	}
+
+	return true
 }
 
 func executeCommand(command string) (string, error) {

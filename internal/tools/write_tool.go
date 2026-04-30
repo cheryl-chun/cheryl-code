@@ -58,3 +58,7 @@ func (w *WriteTool) Parameters() any {
 		"required": []string{"file_path", "content"},
 	}
 }
+
+func (w *WriteTool) RequiresApproval(args map[string]any) bool {
+	return true
+}
