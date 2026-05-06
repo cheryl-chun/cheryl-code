@@ -105,12 +105,30 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 		a.manager.AddUser(prompt)
 
 		for {
+			select {
+			case <-ctx.Done():
+				eventCh <- StreamEvent{
+					Type:  StreamError,
+					Error: fmt.Errorf("stopped by user"),
+				}
+				return
+			default:
+			}
 			stream := a.client.ChatStream(ctx, a.manager.GetAll())
 			var fullContent string
 			toolCallsBuilder := make(map[int64]*ToolCallBuilder)
 
 			// read stream output
 			for stream.Next() {
+				select {
+				case <-ctx.Done():
+					eventCh <- StreamEvent{
+						Type:  StreamError,
+						Error: fmt.Errorf("stopped by user"),
+					}
+					return
+				default:
+				}
 				chunk := stream.Current()
 
 				if len(chunk.Choices) == 0 {
@@ -228,6 +246,27 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 			var toolResults []ToolResults
 
 			for _, tc := range allToolStates {
+				if tc.Status() == ToolStatusRejected {
+					// 将拒绝信息添加到消息历史
+					rejectMsg := fmt.Sprintf("Tool '%s' was rejected by user.", tc.Name)
+					
+					toolCalls = append(toolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+						OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+							ID: tc.ID,
+							Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+								Name:      tc.Name,
+								Arguments: tc.ArgsRaw,
+							},
+							Type: "function",
+						},
+					})
+
+					toolResults = append(toolResults, ToolResults{
+						id:     tc.ID,
+						result: rejectMsg,
+					})
+					continue
+				}
 				if tc.Status() != ToolStatusRunning && tc.Status() != ToolStatusApproved {
 					continue
 				}
@@ -277,6 +316,12 @@ func (a *Agent) RunStream(ctx context.Context, prompt string) (<-chan StreamEven
 					id:     tc.ID,
 					result: result,
 				})
+			}
+
+			// 如果所有工具都被拒绝，告诉 LLM 并结束
+			if len(toolResults) == 0 && len(allToolStates) > 0 {
+				eventCh <- StreamEvent{Type: StreamDone}
+				return
 			}
 
 			a.manager.AddAssistant(fullContent, toolCalls)

@@ -40,7 +40,7 @@ func (a *AgentState) AddToolCall(tc *ToolCallState) {
 
 	// if tool need to approve
 	// add tool to pending queue
-	if tc.NeedApproval && tc.Status() == ToolStatusApproved {
+	if tc.NeedApproval && tc.Status() == ToolStatusPendingApproval {
 		a.PendingApprovals = append(a.PendingApprovals, tc)
 		a.Status = AgentWaitingApproval
 	}

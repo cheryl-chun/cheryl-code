@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -15,10 +14,15 @@ import (
 )
 
 type MessageType string
+type ApprovalOption int
 
 const (
-	MessageTypeText     MessageType = "text"
-	MessageTypeToolCall MessageType = "tool_call"
+	MessageTypeText       MessageType    = "text"
+	MessageTypeToolCall   MessageType    = "tool_call"
+	ApprovalOptionApprove ApprovalOption = iota
+	ApprovalOptionReject
+	ApprovalOptionApproveAll
+	ApprovalOptionRejectAll
 )
 
 type Model struct {
@@ -37,6 +41,13 @@ type Model struct {
 	// stream event
 	currentEventCh <-chan llm.StreamEvent
 	streamActive   bool
+
+	cancelFunc context.CancelFunc
+
+	// approval event
+	approvalMode    bool
+	approvalOptions []ApprovalOption
+	approvalCursor  int
 
 	// DEBUG 用
 	lastKey string
@@ -57,7 +68,8 @@ type agentResponseMsg struct {
 }
 
 type streamStartMsg struct {
-	eventCh <-chan llm.StreamEvent
+	eventCh    <-chan llm.StreamEvent
+	cancelFunc context.CancelFunc
 }
 
 type streamEventMsg struct {
@@ -72,6 +84,7 @@ func NewModel(agent *llm.Agent) Model {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message here..."
 	ta.Focus()
+	ta.CharLimit = 0
 
 	vp := viewport.New(80, 20)
 	vp.SetContent(welcomeMessage())
@@ -109,37 +122,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// approve tool
 		if m.agent.GetState().HasPendingApprovals() {
 			switch msg.String() {
-			case "y", "Y":
-				return m.approveTool()
-			case "n", "N":
-				return m.rejectTool()
-			case "a", "A":
-				return m.approveAll()
-			case "r", "R":
-				return m.rejectAll()
+			case "up", "k":
+				// 上移光标
+				if m.approvalCursor > 0 {
+					m.approvalCursor--
+				}
+
+				return m, nil
+			case "down", "j":
+				if m.approvalCursor < len(m.approvalOptions)-1 {
+					m.approvalCursor++
+				}
+				return m, nil
+			case "enter":
+				return m.executeApprovalOption()
+			case "esc":
+				return m, nil
+			case "ctrl+c":
+				return m, tea.Quit
+			default:
+				return m, nil
 			}
 		}
 
 		switch msg.String() {
 		case "ctrl+c":
+			if m.waiting || m.streamActive {
+				return m.stopAgent()
+			}
 			return m, tea.Quit
-		}
-
-		if msg.Type == tea.KeyEnter && !m.waiting {
-			return m.sendMessage()
+		case "alt+enter":
+			m.textarea.SetValue(m.textarea.Value() + "\n")
+			return m, nil
+		case "enter":
+			if !m.waiting && !m.approvalMode {
+				return m.sendMessage()
+			}
 		}
 
 	case streamStartMsg:
 		m.streamActive = true
 		m.currentEventCh = msg.eventCh
+		m.cancelFunc = msg.cancelFunc
 
 		m.addMessage(Message{
-			Type: MessageTypeText,
-			Role: "assistant",
+			Type:    MessageTypeText,
+			Role:    "assistant",
 			Content: "",
 		})
 		return m, listenStreamEvent(msg.eventCh)
-	
+
 	case streamEventMsg:
 		return m.handleStreamEvent(msg.event)
 	case tea.WindowSizeMsg:
@@ -197,7 +229,7 @@ func (m Model) View() string {
 				Foreground(lipgloss.AdaptiveColor{Light: "#343433", Dark: "#C1C6B2"}).
 				Background(subtle).
 				Padding(0, 1).
-				Width(m.width) // ← 撑满宽度
+				Width(m.width) // 撑满宽度
 
 		inputBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
@@ -205,10 +237,43 @@ func (m Model) View() string {
 				Width(m.width - 4) // 减去边框宽度
 	)
 
-	// 状态栏内容
-	statusText := "Enter: Send • Ctrl+C: Quit"
-	if m.waiting {
-		statusText = fmt.Sprintf("%s Processing...", m.spinner.View())
+	var statusText string
+	var inputArea string
+
+	if m.approvalMode && m.agent.GetState().HasPendingApprovals() {
+		pendingCount := len(m.agent.GetState().PendingApprovals)
+		currentTool := m.agent.GetState().PendingApprovals[0]
+
+		statusText = fmt.Sprintf("⚠️  Approval required (%d pending) • [↑↓] Select [Enter] Confirm", pendingCount)
+
+		// 渲染选择器
+		selectorContent := renderApprovalSelector(currentTool, m.approvalOptions, m.approvalCursor, m.width-4)
+
+		selectorStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("yellow")).
+			Width(m.width-4).
+			Padding(1, 2)
+
+		inputArea = selectorStyle.Render(selectorContent)
+	} else if m.waiting {
+		// ========== 等待模式 ==========
+		statusText = "Processing... • [Ctrl+C] Stop"
+
+		// Processing 内容（替代输入框）
+		processingStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("cyan")).
+			Padding(1, 2).
+			Width(m.width - 4).
+			Align(lipgloss.Center)
+
+		processingContent := fmt.Sprintf("%s Processing...", m.spinner.View())
+		inputArea = processingStyle.Render(processingContent)
+	} else {
+		// ========== 普通模式：输入框 ==========
+		statusText = "Enter: Send • Ctrl+C: Quit • Alt+Enter: NewLine"
+		inputArea = inputBoxStyle.Render(m.textarea.View())
 	}
 
 	// 组装界面
@@ -216,7 +281,7 @@ func (m Model) View() string {
 		lipgloss.Left,
 		m.viewport.View(),
 		"", // 空行
-		inputBoxStyle.Render(m.textarea.View()),
+		inputArea,
 		statusBarStyle.Render(statusText),
 	)
 }
@@ -241,10 +306,16 @@ func (m Model) sendMessage() (Model, tea.Cmd) {
 
 func (m *Model) startAgentStream(prompt string) tea.Cmd {
 	return func() tea.Msg {
-		ctx := context.Background()
+		// 创建可取消的 context
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// ✅ 保存到 Model（这需要返回一个特殊的消息类型）
+		// 由于 Cmd 不能直接修改 Model，我们需要在 Update 中处理
+
 		eventCh, err := m.agent.RunStream(ctx, prompt)
 
 		if err != nil {
+			cancel() // 发生错误，取消 context
 			return streamEventMsg{
 				event: llm.StreamEvent{
 					Type:  llm.StreamError,
@@ -252,13 +323,18 @@ func (m *Model) startAgentStream(prompt string) tea.Cmd {
 				},
 			}
 		}
-		return streamStartMsg{eventCh: eventCh}
+
+		// ✅ 返回一个包含 cancelFunc 的消息
+		return streamStartMsg{
+			eventCh:    eventCh,
+			cancelFunc: cancel,
+		}
 	}
 }
 
 func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 	switch event.Type {
-	
+
 	// ========== 文本内容（逐字追加）==========
 	case llm.StreamContent:
 		// 找到最后一个 assistant 消息，追加内容
@@ -270,7 +346,7 @@ func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 		}
 		m.updateViewportContent()
 		m.viewport.GotoBottom()
-		
+
 		// 继续监听下一个事件
 		return m, listenStreamEvent(m.currentEventCh)
 
@@ -283,7 +359,12 @@ func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 		})
 		m.updateViewportContent()
 		m.viewport.GotoBottom()
-		
+
+		if !m.approvalMode {
+			m.approvalMode = true
+			m.initApprovalOptions()
+		}
+
 		// 继续监听（可能还有更多工具）
 		return m, listenStreamEvent(m.currentEventCh)
 
@@ -291,25 +372,25 @@ func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 	case llm.StreamToolCall:
 		// 如果消息列表中还没有这个工具，添加
 		found := false
-		for _, msg := range m.messages {
-			if msg.Type == MessageTypeToolCall && 
-			   msg.ToolCall != nil && 
-			   msg.ToolCall.ID == event.ToolCall.ID {
+		for i := range m.messages {
+			if m.messages[i].Type == MessageTypeToolCall &&
+				m.messages[i].ToolCall != nil &&
+				m.messages[i].ToolCall.ID == event.ToolCall.ID {
 				found = true
 				break
 			}
 		}
-		
+
 		if !found {
 			m.addMessage(Message{
 				Type:     MessageTypeToolCall,
 				ToolCall: event.ToolCall,
 			})
 		}
-		
+
 		m.updateViewportContent()
 		m.viewport.GotoBottom()
-		
+
 		return m, listenStreamEvent(m.currentEventCh)
 
 	// ========== 工具结果 ==========
@@ -317,7 +398,7 @@ func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 		// 更新对应工具的显示
 		m.updateViewportContent()
 		m.viewport.GotoBottom()
-		
+
 		return m, listenStreamEvent(m.currentEventCh)
 
 	// ========== 流结束 ==========
@@ -331,14 +412,14 @@ func (m Model) handleStreamEvent(event llm.StreamEvent) (Model, tea.Cmd) {
 	case llm.StreamError:
 		m.waiting = false
 		m.streamActive = false
-		
+
 		m.addMessage(Message{
 			Type:    MessageTypeText,
 			Role:    "assistant",
 			Content: fmt.Sprintf("Error: %v", event.Error),
 		})
 		m.updateViewportContent()
-		
+
 		return m, nil
 
 	default:
@@ -388,20 +469,17 @@ func (m *Model) updateViewportContent() {
 		switch msg.Type {
 		case MessageTypeText:
 			if msg.Role == "user" {
-				sb.WriteString(fmt.Sprintf("👤 You:\n%s\n\n", msg.Content))
+				sb.WriteString(renderUserMessage(msg.Content, m.width))
 			} else {
-
-				sb.WriteString(fmt.Sprintf("🤖 Assistant:\n%s\n\n", msg.Content))
+				sb.WriteString(renderAssistantMessage(msg.Content, m.width))
 			}
 		case MessageTypeToolCall:
-			sb.WriteString(renderToolCall(msg.ToolCall))
-			sb.WriteString("\n")
+			sb.WriteString(renderToolCall(msg.ToolCall, m.width))
 		}
-		sb.WriteString("────────────────────────────────────\n\n")
-	}
 
-	if m.waiting && !m.agent.GetState().HasPendingApprovals() {
-		sb.WriteString("⏳ Processing...\n")
+		sb.WriteString("\n")
+		sb.WriteString(renderSeparator(m.width))
+		sb.WriteString("\n\n")
 	}
 
 	m.viewport.SetContent(sb.String())
@@ -468,91 +546,85 @@ func (m Model) rejectAll() (Model, tea.Cmd) {
 	return m, listenStreamEvent(m.currentEventCh)
 }
 
-func welcomeMessage() string {
-	return `
-╔════════════════════════════════════════╗
-║       Cheryl Code - AI Assistant       ║
-╚════════════════════════════════════════╝
+func (m *Model) initApprovalOptions() {
+	pending := m.agent.GetState().PendingApprovals
 
-Welcome! Type your message below.
-
-Commands:
-  • Ctrl+Enter - Send message
-  • Ctrl+C     - Quit
-  • ↑/↓        - Scroll history
-
-`
+	if len(pending) == 1 {
+		m.approvalOptions = []ApprovalOption{
+			ApprovalOptionApprove,
+			ApprovalOptionReject,
+		}
+	} else {
+		m.approvalOptions = []ApprovalOption{
+			ApprovalOptionApprove,
+			ApprovalOptionReject,
+			ApprovalOptionApproveAll,
+			ApprovalOptionRejectAll,
+		}
+	}
+	m.approvalCursor = 0
 }
 
-func renderToolCall(tc *llm.ToolCallState) string {
-	if tc == nil {
-		return ""
+func (m Model) executeApprovalOption() (Model, tea.Cmd) {
+	if m.approvalCursor >= len(m.approvalOptions) {
+		return m, nil
 	}
 
-	state := tc.State()
+	selectedOption := m.approvalOptions[m.approvalCursor]
+	pending := m.agent.GetState().PendingApprovals
 
-	var sb strings.Builder
-
-	// 标题行：图标 + 工具名 + 状态
-	titleStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color(state.Color())).
-		Bold(true)
-
-	sb.WriteString(titleStyle.Render(
-		fmt.Sprintf("%s %s [%s]", state.Icon(), tc.Name, tc.Status())))
-	sb.WriteString("\n")
-
-	// 参数（灰色，缩进）
-	if len(tc.Args) > 0 {
-		argsJSON, _ := json.MarshalIndent(tc.Args, "  ", "  ")
-		argsStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240")).
-			Faint(true)
-		sb.WriteString(argsStyle.Render(fmt.Sprintf("  Args: %s", string(argsJSON))))
-		sb.WriteString("\n")
-	}
-
-	// 如果是等待审批状态，显示操作提示
-	if tc.Status() == llm.ToolStatusPendingApproval {
-		hintStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("yellow")).
-			Background(lipgloss.Color("235")).
-			Padding(0, 1).
-			Margin(1, 0)
-
-		sb.WriteString(hintStyle.Render(
-			"[Y] Approve  [N] Reject  [A] Approve all  [R] Reject all"))
-		sb.WriteString("\n")
-	}
-
-	// 结果（如果有）
-	if tc.Result != "" {
-		result := tc.Result
-		if len(result) > 500 {
-			result = result[:500] + "..."
+	switch selectedOption {
+	case ApprovalOptionApprove:
+		if len(pending) > 0 {
+			if err := m.agent.ApproveToolCall(pending[0].ID); err != nil {
+				return m, nil
+			}
 		}
 
-		resultStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("blue"))
-		sb.WriteString(resultStyle.Render(fmt.Sprintf("  Result: %s", result)))
-		sb.WriteString("\n")
+	case ApprovalOptionReject:
+		if len(pending) > 0 {
+			if err := m.agent.RejectToolCall(pending[0].ID); err != nil {
+				return m, nil
+			}
+		}
+
+	case ApprovalOptionApproveAll:
+		if err := m.agent.ApproveAll(); err != nil {
+			return m, nil
+		}
+
+	case ApprovalOptionRejectAll:
+		if err := m.agent.RejectAll(); err != nil {
+			return m, nil
+		}
 	}
 
-	// 错误（如果有）
-	if tc.Error != nil {
-		errorStyle := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("red"))
-		sb.WriteString(errorStyle.Render(fmt.Sprintf("  Error: %v", tc.Error)))
-		sb.WriteString("\n")
+	m.updateViewportContent()
+
+	// 检查是否还有待审批的
+	if m.agent.GetState().HasPendingApprovals() {
+		m.initApprovalOptions()
+		return m, listenStreamEvent(m.currentEventCh)
+	} else {
+		m.approvalMode = false
+		m.agent.ResumeExecution()
+		return m, listenStreamEvent(m.currentEventCh)
+	}
+}
+
+func (m Model) stopAgent() (Model, tea.Cmd) {
+	if m.cancelFunc != nil {
+		m.cancelFunc()
 	}
 
-	// 耗时
-	if !tc.CompletedAt.IsZero() {
-		durationStyle := lipgloss.NewStyle().Faint(true)
-		sb.WriteString(durationStyle.Render(
-			fmt.Sprintf("  Duration: %v", tc.Duration())))
-		sb.WriteString("\n")
-	}
+	m.waiting = false
+	m.streamActive = false
 
-	return sb.String()
+	m.addMessage(Message{
+		Type:    MessageTypeText,
+		Role:    "assistant",
+		Content: "⚠️ Stopped by user",
+	})
+
+	return m, nil
 }
