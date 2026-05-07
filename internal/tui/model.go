@@ -49,6 +49,10 @@ type Model struct {
 	approvalOptions []ApprovalOption
 	approvalCursor  int
 
+	// tool choose
+	toolSelectMode   bool
+	toolSelectCursor int
+
 	// DEBUG 用
 	lastKey string
 }
@@ -59,7 +63,8 @@ type Message struct {
 	Content string
 
 	// tool execute
-	ToolCall *llm.ToolCallState
+	ToolCall     *llm.ToolCallState
+	ToolExpanded bool
 }
 
 type agentResponseMsg struct {
@@ -119,7 +124,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastKey = fmt.Sprintf("Key: %s | Type: %d | Alt: %v",
 			msg.String(), msg.Type, msg.Alt)
 
-		// approve tool
+		// approval mode
 		if m.agent.GetState().HasPendingApprovals() {
 			switch msg.String() {
 			case "up", "k":
@@ -145,6 +150,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// tool select mode
+		if m.toolSelectMode {
+			return m.handleToolSelectMode(msg.String())
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			if m.waiting || m.streamActive {
@@ -154,6 +164,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "alt+enter":
 			m.textarea.SetValue(m.textarea.Value() + "\n")
 			return m, nil
+		case "ctrl+t":
+			if !m.waiting && !m.approvalMode {
+				return m.enterToolSelectMode()
+			}
 		case "enter":
 			if !m.waiting && !m.approvalMode {
 				return m.sendMessage()
@@ -221,6 +235,21 @@ func (m Model) View() string {
 		return "Initializing..."
 	}
 
+	// 动态调整 viewport 高度
+	headerHeight := 2
+	footerHeight := 2 // statusBar 高度
+	textareaHeight := 4
+
+	var vpHeight int
+	if m.toolSelectMode {
+		// 工具选择模式：不需要预留 inputArea 空间
+		vpHeight = m.height - headerHeight - footerHeight
+	} else {
+		// 普通/审批模式：需要预留 inputArea 空间
+		vpHeight = m.height - headerHeight - textareaHeight - footerHeight
+	}
+	m.viewport.Height = vpHeight
+
 	// 定义样式
 	var (
 		subtle = lipgloss.AdaptiveColor{Light: "#D9DCCF", Dark: "#383838"}
@@ -270,6 +299,15 @@ func (m Model) View() string {
 
 		processingContent := fmt.Sprintf("%s Processing...", m.spinner.View())
 		inputArea = processingStyle.Render(processingContent)
+	} else if m.toolSelectMode {
+		// ========== 工具选择模式 ==========
+		toolCount := len(m.getToolCallIndices())
+		statusText = fmt.Sprintf("📋 Tool Select (%d/%d) • [↑↓] Navigate [Enter] Expand/Collapse [Esc] Exit",
+			m.toolSelectCursor+1, toolCount)
+
+		// 隐藏输入框（不显示任何内容）
+		inputArea = ""
+
 	} else {
 		// ========== 普通模式：输入框 ==========
 		statusText = "Enter: Send • Ctrl+C: Quit • Alt+Enter: NewLine"
@@ -277,6 +315,16 @@ func (m Model) View() string {
 	}
 
 	// 组装界面
+	if inputArea == "" {
+		// 工具选择模式：不显示输入框区域
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.viewport.View(),
+			statusBarStyle.Render(statusText),
+		)
+	}
+
+	// 普通模式/审批模式：显示输入框或选择器
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.viewport.View(),
@@ -457,32 +505,6 @@ func (m *Model) callAgent(prompt string) tea.Cmd {
 func (m *Model) addMessage(msg Message) {
 	m.messages = append(m.messages, msg)
 	m.updateViewportContent()
-}
-
-func (m *Model) updateViewportContent() {
-	var sb strings.Builder
-
-	sb.WriteString(welcomeMessage())
-	sb.WriteString("\n")
-
-	for _, msg := range m.messages {
-		switch msg.Type {
-		case MessageTypeText:
-			if msg.Role == "user" {
-				sb.WriteString(renderUserMessage(msg.Content, m.width))
-			} else {
-				sb.WriteString(renderAssistantMessage(msg.Content, m.width))
-			}
-		case MessageTypeToolCall:
-			sb.WriteString(renderToolCall(msg.ToolCall, m.width))
-		}
-
-		sb.WriteString("\n")
-		sb.WriteString(renderSeparator(m.width))
-		sb.WriteString("\n\n")
-	}
-
-	m.viewport.SetContent(sb.String())
 }
 
 func (m Model) approveTool() (Model, tea.Cmd) {
