@@ -45,6 +45,7 @@ func GetDefaultRegistry() *ToolRegistry {
 	registry.Register(NewReadTool(rootPath))
 	registry.Register(NewWriteTool(rootPath))
 	registry.Register(NewBashTool())
+	registry.Register(NewGlobTool(rootPath))
 
 	return registry
 }
